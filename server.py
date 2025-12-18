@@ -107,7 +107,7 @@ class QuizServer:
                         lines[i + 2],
                         lines[i + 3]
                     ],
-                    'ans': lines[i + 4].upper()
+                    'ans': lines[i + 4].split(":")[-1].strip().upper()
                 }
                 self.questions.append(question_dict)
             self._log(f"Loaded {len(self.questions)} questions from file")
