@@ -49,7 +49,7 @@ class QuizServer:
         num_questions_label.pack(side=tk.LEFT, padx=(15, 0))
         self.num_questions_entry = tk.Entry(game_frame, width=5)
         self.num_questions_entry.pack(side=tk.LEFT, padx=(5, 15))
-        self.num_questions_entry.insert(0, "5")
+        self.num_questions_entry.insert(0, "0")
         self.start_game_button = tk.Button(
             game_frame,
             text="Start Game",
@@ -212,28 +212,63 @@ class QuizServer:
             key=lambda x: x[1],
             reverse=True
         )
+
         scoreboard_lines = []
         current_rank = 1
         prev_score = None
+
         for i, (username, score) in enumerate(sorted_players):
             if prev_score is not None and score < prev_score:
                 current_rank = i + 1
-            scoreboard_lines.append(f"{current_rank}-{username}-{score}")
+
+            if username not in self.connected_clients:
+                label = " (disconnected)"
+            else:
+                label = ""
+
+            scoreboard_lines.append(f"{current_rank}. {username} - {score}{label}")
             prev_score = score
+
         return "\n".join(scoreboard_lines)
 
-    def _broadcast_scores(self, points_this_round, correct_answer):
+    def _broadcast_scores(
+        self,
+        points_this_round,
+        correct_answer,
+        first_correct_username,
+        num_correct
+    ):
         scoreboard = self._generate_scoreboard()
-        self._log(f"Scoreboard:\n{scoreboard}")
+        self._log("Scoreboard:")
+        for line in scoreboard.split("\n"):
+            self._log(line)
+
+    
+
         for username, client_socket in self.connected_clients.items():
             was_correct = self.current_answers.get(username) == correct_answer
-            result = "Correct" if was_correct else "Wrong"
+
+            if (
+                username == first_correct_username
+                and was_correct
+                and num_correct >= 2
+            ):
+                result = "Correct First, you get speed bonus!"
+            elif was_correct:
+                result = "Correct"
+            else:
+                result = "Wrong"
+
             points = points_this_round.get(username, 0)
             total = self.player_scores.get(username, 0)
             msg = f"SCORE|{result}|{points}|{total}|{scoreboard}"
+
             try:
                 client_socket.send(msg.encode('utf-8'))
-                self._log(f"Sent score to '{username}': {result}, +{points} pts, total: {total}")
+                self._log(
+                    f"Sent score to '{username}': {result}, "
+                    f"+{points} pts, total: {total}"
+                )
             except socket.error as e:
                 self._log(f"Error sending score to '{username}': {e}")
 
@@ -253,26 +288,45 @@ class QuizServer:
         self._log(f"Answers: {self.current_answers}")
         self._log(f"Correct: {correct_answer}")
         self._log(f"Answer order: {self.answer_arrival_order}")
+
         points_this_round = {}
+
         for username, answer in self.current_answers.items():
-            if answer == correct_answer:
-                self.player_scores[username] += 1
-                points_this_round[username] = 1
-                self._log(f"{username}: +1 base point (correct)")
-            else:
-                points_this_round[username] = 0
-                self._log(f"{username}: 0 points (wrong)")
-        for username in self.answer_arrival_order:
-            if self.current_answers.get(username) == correct_answer:
-                bonus = len(self.connected_clients) - 1
-                self.player_scores[username] += bonus
-                points_this_round[username] += bonus
-                self._log(f"Speed bonus: {username} gets +{bonus} points (answered first correctly)!")
-                break
-        self._broadcast_scores(points_this_round, correct_answer)
+            if username in self.connected_clients:
+                if answer == correct_answer:
+                    self.player_scores[username] += 1
+                    points_this_round[username] = 1
+                    self._log(f"{username}: +1 base point (correct)")
+                else:
+                    points_this_round[username] = 0
+                    self._log(f"{username}: 0 points (wrong)")
+
+        correct_players = [
+            u for u in self.answer_arrival_order
+            if self.current_answers.get(u) == correct_answer and u in self.connected_clients
+        ]
+        first_correct_username = correct_players[0] if correct_players else None
+
+        if len(correct_players) >= 2 and first_correct_username is not None:
+            bonus = len(self.connected_clients) - 1
+            self.player_scores[first_correct_username] += bonus
+            points_this_round[first_correct_username] += bonus
+            self._log(
+                f"Speed bonus: {first_correct_username} gets +{bonus} points "
+                "(first correct & multiple correct answers)!"
+            )
+
+        self._broadcast_scores(
+            points_this_round,
+            correct_answer,
+            first_correct_username,
+            len(correct_players)
+        )
+
         self.current_answers.clear()
         self.answer_arrival_order.clear()
         self.current_question_index += 1
+
         if self.current_question_index < self.num_questions_to_play:
             self._log("-" * 30)
             self.root.after(2000, self._broadcast_current_question)
@@ -360,6 +414,16 @@ class QuizServer:
                 return
             username = username_data.decode('utf-8').strip()
             self._log(f"Received username: '{username}' from {client_ip}:{client_port}")
+            if self.game_in_progress:
+                self._log(f"Rejecting '{username}' (game already in progress)")
+                try:
+                    client_socket.send("REJECT|GAME_IN_PROGRESS".encode('utf-8'))
+                except socket.error:
+                    pass
+                client_socket.close()
+                self._log(f"Connection closed with {client_ip}:{client_port}")
+                self._log("-" * 40)
+                return
             with self.clients_lock:
                 if username in self.connected_clients:
                     self._log(f"Username '{username}' is already taken. Rejecting connection.")
@@ -400,9 +464,7 @@ class QuizServer:
                         self._broadcast_disconnect(username)
                         if self.game_in_progress:
                             self._log(f"Player '{username}' left during active game!")
-                            if username in self.player_scores:
-                                del self.player_scores[username]
-                                self._log(f"Removed '{username}' from scoreboard")
+   
                             if username in self.current_answers:
                                 del self.current_answers[username]
                                 self._log(f"Removed '{username}' from current answers")
